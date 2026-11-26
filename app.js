@@ -16,7 +16,8 @@ function load() {
 let S = load();
 function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('저장 실패: 브라우저 저장소를 쓸 수 없어요'); } }
 const prof = () => S.profiles.find(p => p.id === S.current) || S.profiles[0];
-const pdata = () => (S.data[prof().id] ||= { records: {}, custom: [] });
+const pdata = () => (S.data[prof().id] ||= { records: {}, custom: [], exams: [] });
+const examList = () => (pdata().exams ||= []);
 function toast(m) { const t = $('#toast'); t.textContent = m; t.classList.add('on'); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('on'), 2200); }
 
 /* ---------- 항목·판정 ---------- */
@@ -156,8 +157,10 @@ function stackChart(rows) {
 }
 
 /* ---------- 상태 ---------- */
-const state = { view: 'summary', from: 'summary', detail: null, q: '', sel: null, inYear: null, sumYear: null };
-const TABS = [['summary', '요약'], ['table', '연도별 표'], ['trend', '추이'], ['input', '입력'], ['data', '설정·데이터']];
+const state = { view: 'summary', from: 'summary', detail: null, q: '', sel: null, inYear: null, sumYear: null, examTag: '', examKind: '', editExam: null };
+const TABS = [['summary', '요약'], ['table', '연도별 표'], ['trend', '추이'], ['exams', '검사 기록'], ['input', '수치 입력'], ['data', '설정·데이터']];
+const TAGS = { '정상': 'ok', '경과관찰': 'warn', '이상': 'bad', '조치': 'act', '예정': 'plan' };
+const tagBadge = t => `<span class="badge ${TAGS[t] || 'none'}">${esc(t)}</span>`;
 const badge = st => `<span class="badge ${st}">${LABEL[st]}</span>`;
 const dItem = (item, ser) => {
   const s = stats(item, ser); if (!s.prev) return '<span class="flat small">비교 없음</span>';
@@ -171,13 +174,42 @@ const rowHtml = (item, ser) => {
   return `<div class="it" data-act="detail" data-id="${esc(item.id)}"><div class="nm">${esc(item.name)}<small>${esc(item.cat)} · ${l.year}년</small></div>${spark(ser, item)}<div style="text-align:right"><div class="val">${fv(item, l.value)} <small class="muted">${esc(item.unit)}</small> ${badge(l.status)}</div>${dItem(item, ser)}</div></div>`;
 };
 const hasData = () => years().length > 0;
+
+/* 다음에 받을 검사: 직전 기록의 권장 추적 연도 + 예정 항목 */
+function upcoming() {
+  const list = examList(), map = {};
+  const doneAfter = (kind, y) => list.some(e => e.kind === kind && e.tag !== '예정' && e.year >= y);
+  const latest = {};
+  list.filter(e => e.tag !== '예정').forEach(e => { if (!latest[e.kind] || e.year > latest[e.kind].year || (e.year === latest[e.kind].year && (e.date || '') > (latest[e.kind].date || ''))) latest[e.kind] = e; });
+  for (const k in latest) { const l = latest[k]; if (l.due && !doneAfter(k, l.due)) map[k] = { kind: k, due: +l.due, last: l, plan: null }; }
+  list.filter(e => e.tag === '예정' && !doneAfter(e.kind, e.year)).forEach(e => { map[e.kind] = { kind: e.kind, due: e.year, last: latest[e.kind] || null, plan: e }; });
+  return Object.values(map).sort((a, b) => a.due - b.due || a.kind.localeCompare(b.kind));
+}
+function upHtml() {
+  const up = upcoming(); if (!up.length) return '';
+  const Y = new Date().getFullYear();
+  return `<div class="card"><h3>다음에 받을 검사 (${up.length})</h3><div class="list">${up.map(u => {
+    const late = u.due < Y, now = u.due === Y;
+    const lab = u.plan ? (late ? '기간 지남' : now ? '올해 예정' : `${u.due}년 예정`) : (late ? `${u.due}년 권장 · 지남` : now ? '올해 권장' : `${u.due}년 권장`);
+    const cls = late ? 'bad' : now ? 'warn' : 'plan';
+    const info = (u.plan ? u.plan.result : u.last.result) || '';
+    const prev = u.plan && u.last ? ` · 직전 ${u.last.year}년: ${u.last.result || ''}` : u.last && !u.plan ? ` · 마지막 ${u.last.year}년` : '';
+    return `<div class="it" data-act="filterKind" data-v="${esc(u.kind)}"><div class="nm">${esc(u.kind)}<small>${esc(info + prev)}</small></div><span class="badge ${cls}">${lab}</span></div>`;
+  }).join('')}</div></div>`;
+}
+const examRow = (e, showYear) => `<div class="ex"><div class="exh"><b>${esc(e.kind)}</b> ${tagBadge(e.tag)} <span class="muted small">${showYear ? e.year + '년 ' : ''}${esc(e.date || '')} ${esc(e.place || '')}</span><span class="sp"></span><button class="btn small" data-act="editExam" data-id="${esc(e.id)}">수정</button></div>${e.result ? `<div>${esc(e.result)}</div>` : ''}${e.note ? `<div class="muted small">${esc(e.note)}</div>` : ''}${e.due ? `<div class="small muted">권장 추적: ${esc(e.due)}년</div>` : ''}</div>`;
+function defaultYear(ys) {
+  const cnt = ys.map(y => items().filter(it => series(it).some(p => p.year === y)).length), mx = Math.max(...cnt);
+  for (let i = ys.length - 1; i >= 0; i--) if (cnt[i] >= mx / 2) return ys[i];
+  return ys[ys.length - 1];
+}
 const emptyHtml = () => `<div class="card empty"><h2>아직 검진 결과가 없어요</h2><p>‘입력’ 탭에서 연도별 결과를 넣거나, 샘플 데이터로 먼저 둘러보세요.</p><button class="btn pri" data-act="sample">샘플 데이터 불러오기</button> <button class="btn" data-act="goInput">직접 입력하기</button></div>`;
 
 /* ---------- 뷰 ---------- */
 const views = {
   summary() {
-    if (!hasData()) return emptyHtml();
-    const ys = years(); const Y = ys.includes(state.sumYear) ? state.sumYear : ys[ys.length - 1];
+    if (!hasData()) return upHtml() + emptyHtml();
+    const ys = years(); const Y = ys.includes(state.sumYear) ? state.sumYear : defaultYear(ys);
     const rec = pdata().records[Y], idx = ys.indexOf(Y);
     const all = items().map(it => ({ it, ser: series(it).filter(p => p.year <= Y) })).filter(x => x.ser.length && x.ser[x.ser.length - 1].year === Y);
     const cnt = { ok: 0, warn: 0, bad: 0 };
@@ -189,6 +221,7 @@ const views = {
       <select data-chg="sumYear">${ys.slice().reverse().map(y => `<option ${y === Y ? 'selected' : ''}>${y}</option>`).join('')}</select></div>
       <div class="cnt" style="margin-top:12px"><div class="ok"><b>${cnt.ok}</b>정상</div><div class="warn"><b>${cnt.warn}</b>주의</div><div class="bad"><b>${cnt.bad}</b>이상</div></div>
       ${idx > 0 ? `<p class="muted small" style="margin:10px 0 0">전회(${ys[idx - 1]}년) 대비 판정이 좋아진 항목 <b class="down">${better.length}</b>개 · 나빠진 항목 <b class="up">${worse.length}</b>개</p>` : ''}</div>
+      ${upHtml()}
       <div class="card"><h3>관리가 필요한 항목 (${need.length})</h3>${need.length ? `<div class="list">${need.map(x => rowHtml(x.it, x.ser)).join('')}</div>` : '<p class="muted">주의·이상 항목이 없어요 👍</p>'}</div>
       ${worse.length ? `<div class="card"><h3>전회보다 나빠진 항목</h3><div class="list">${worse.map(x => rowHtml(x.it, x.ser)).join('')}</div></div>` : ''}
       ${better.length ? `<div class="card"><h3>전회보다 좋아진 항목</h3><div class="list">${better.map(x => rowHtml(x.it, x.ser)).join('')}</div></div>` : ''}
@@ -219,6 +252,36 @@ const views = {
       <span class="chip" data-act="selAll">전체</span><span class="chip" data-act="selNone">해제</span></div>
       ${shown.length ? `<div class="grid">${shown.map(({ it, ser }) => { const l = ser[ser.length - 1]; return `<div class="card"><div class="row"><h3 style="margin:0;cursor:pointer" data-act="detail" data-id="${esc(it.id)}">${esc(it.name)}</h3><span class="sp"></span>${badge(l.status)}</div><div class="muted small">${esc(refText(it))} (${esc(it.unit)})</div>${lineChart(ser, it, { compact: true })}<div>${dItem(it, ser)}</div></div>`; }).join('')}</div>` : '<p class="muted">위에서 보고 싶은 항목을 선택하세요.</p>'}`;
   },
+  exams() {
+    const list = examList(), Z = state.examTag, K = state.examKind;
+    const ed = list.find(e => e.id === state.editExam) || { year: new Date().getFullYear(), tag: '정상' };
+    const kinds = [...new Set(list.map(e => e.kind))];
+    const form = `<details class="card" ${state.editExam || !list.length ? 'open' : ''}><summary><b>${state.editExam ? '검사 기록 수정' : '+ 검사 기록 추가'}</b></summary>
+      <div class="flds" style="margin-top:10px">
+        <label class="fld"><span>연도</span><input type="number" id="ex_year" value="${esc(ed.year)}"></label>
+        <label class="fld"><span>검사일</span><input type="text" id="ex_date" value="${esc(ed.date || '')}" placeholder="2025-05-16"></label>
+        <label class="fld"><span>병원·과</span><input type="text" id="ex_place" value="${esc(ed.place || '')}"></label>
+        <label class="fld"><span>검사 종류</span><input type="text" id="ex_kind" list="kinds" value="${esc(ed.kind || '')}" placeholder="예) 갑상선 초음파"><datalist id="kinds">${kinds.map(k => `<option value="${esc(k)}">`).join('')}</datalist></label>
+        <label class="fld"><span>상태</span><select id="ex_tag">${Object.keys(TAGS).map(t => `<option ${t === ed.tag ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+        <label class="fld"><span>권장 추적 연도 <small>(선택)</small></span><input type="number" id="ex_due" value="${esc(ed.due || '')}" placeholder="예) 2027"></label>
+      </div>
+      <label class="fld"><span>결과 한 줄</span><input type="text" id="ex_result" value="${esc(ed.result || '')}" style="width:100%"></label>
+      <label class="fld" style="display:block;margin-top:8px"><span>상세 소견·메모</span><textarea id="ex_note">${esc(ed.note || '')}</textarea></label>
+      <div class="row" style="margin-top:10px"><button class="btn pri" data-act="saveExam">저장</button>${state.editExam ? '<button class="btn" data-act="cancelExam">취소</button><button class="btn del" data-act="delExam">삭제</button>' : ''}</div></details>`;
+    if (!list.length) return form + '<div class="card empty">아직 검사 기록이 없어요. 위에서 추가하세요. 시트의 글 소견(내시경·초음파·MRI 결과, 의사 말씀, 다음 검사 계획)을 넣는 곳입니다.</div>';
+    const ys = [...new Set(list.map(e => e.year))].sort((a, b) => a - b);
+    const kindRows = kinds.map(k => ({ k, n: list.filter(e => e.kind === k).length })).sort((a, b) => b.n - a.n || a.k.localeCompare(b.k));
+    const matrix = `<div class="card tw"><h3>검사 이력 <small class="muted">(종류를 누르면 아래에 모아 봅니다)</small></h3><table><thead><tr><th>검사</th>${ys.map(y => `<th>${y}</th>`).join('')}</tr></thead><tbody>${kindRows.map(({ k }) => `<tr class="link" data-act="filterKind" data-v="${esc(k)}"><td>${K === k ? '▶ ' : ''}${esc(k)}</td>${ys.map(y => {
+      const es = list.filter(e => e.kind === k && e.year === y); if (!es.length) return '<td class="muted">·</td>';
+      const e = es[es.length - 1]; return `<td class="${TAGS[e.tag] || ''}" title="${esc((e.result || '') + (es.length > 1 ? ` (+${es.length - 1}건)` : ''))}">${esc(e.tag)}</td>`;
+    }).join('')}</tr>`).join('')}</tbody></table></div>`;
+    const shown = list.filter(e => (!Z || e.tag === Z) && (!K || e.kind === K));
+    const byY = {}; shown.forEach(e => (byY[e.year] ||= []).push(e));
+    const tl = Object.keys(byY).map(Number).sort((a, b) => b - a).map(y => `<div class="card"><h3>${y}년 <small class="muted">${byY[y].length}건</small></h3>${byY[y].map(e => examRow(e)).join('')}</div>`).join('');
+    return `${form}${upHtml()}${matrix}
+      <div class="chips"><span class="chip ${!Z ? 'on' : ''}" data-act="filterTag" data-v="">전체</span>${Object.keys(TAGS).map(t => `<span class="chip ${Z === t ? 'on' : ''}" data-act="filterTag" data-v="${t}">${t}</span>`).join('')}${K ? `<span class="chip on" data-act="filterKind" data-v="${esc(K)}">${esc(K)} ✕</span>` : ''}</div>
+      ${tl || '<p class="muted">조건에 맞는 기록이 없어요.</p>'}`;
+  },
   detail() {
     const it = itemById(state.detail); if (!it) return '<p>항목을 찾을 수 없어요.</p>';
     const ser = series(it), back = `<button class="btn" data-act="back">← 돌아가기</button>`;
@@ -239,7 +302,12 @@ const views = {
     let h = '';
     if (/^\d{4}$/.test(q) && pdata().records[q]) {
       const list = items().map(it => ({ it, p: series(it).find(p => p.year === +q) })).filter(x => x.p);
-      return `<div class="card"><h2>${q}년 검진 결과 (${list.length}개 항목)</h2><div class="list">${list.map(({ it, p }) => `<div class="it" data-act="detail" data-id="${esc(it.id)}"><div class="nm">${esc(it.name)}<small>${esc(it.cat)}</small></div><div class="val">${fv(it, p.value)} <small class="muted">${esc(it.unit)}</small> ${badge(p.status)}</div></div>`).join('')}</div></div>`;
+      const exy = examList().filter(e => e.year === +q);
+      return `<div class="card"><h2>${q}년 검진 결과 (${list.length}개 항목)</h2><div class="list">${list.map(({ it, p }) => `<div class="it" data-act="detail" data-id="${esc(it.id)}"><div class="nm">${esc(it.name)}<small>${esc(it.cat)}</small></div><div class="val">${fv(it, p.value)} <small class="muted">${esc(it.unit)}</small> ${badge(p.status)}</div></div>`).join('')}</div></div>${exy.length ? `<div class="card"><h2>${q}년 검사 기록 (${exy.length}건)</h2>${exy.map(e => examRow(e)).join('')}</div>` : ''}`;
+    }
+    if (/^\d{4}$/.test(q) && examList().some(e => e.year === +q)) {
+      const exy = examList().filter(e => e.year === +q);
+      return `<div class="card"><h2>${q}년 검사 기록 (${exy.length}건)</h2>${exy.map(e => examRow(e)).join('')}</div>`;
     }
     if (LABEL.ok === q || LABEL.warn === q || LABEL.bad === q) {
       const st = Object.keys(LABEL).find(k => LABEL[k] === q);
@@ -247,9 +315,12 @@ const views = {
       return `<div class="card"><h2>최근 결과가 ‘${q}’인 항목 (${list.length})</h2>${list.length ? `<div class="list">${list.map(x => rowHtml(x.it, x.ser)).join('')}</div>` : '<p class="muted">해당 항목이 없어요.</p>'}</div>`;
     }
     const res = items().map(it => ({ it, sc: matchScore(it, q) })).filter(x => x.sc).sort((a, b) => b.sc - a.sc);
-    if (!res.length) return `<div class="card empty">‘${esc(q)}’에 해당하는 검사를 찾지 못했어요.<br><span class="small">예: 콜레스테롤, 혈압, 간, 신장, 빈혈, ㅎㅅㅅ(초성)</span></div>`;
+    const exm = examList().filter(e => norm([e.kind, e.result, e.note, e.place, e.tag].join(' ')).includes(nq)).sort((a, b) => b.year - a.year || (b.date || '').localeCompare(a.date || ''));
+    if (!res.length && !exm.length) return `<div class="card empty">‘${esc(q)}’에 해당하는 검사를 찾지 못했어요.<br><span class="small">예: 콜레스테롤, 혈압, 간, 신장, 빈혈, 갑상선, 내시경, ㅎㅅㅅ(초성)</span></div>`;
     const withData = res.map(r => ({ ...r, ser: series(r.it) }));
-    h = `<p class="muted">‘${esc(q)}’ 검색 결과 ${res.length}건</p><div class="grid">`;
+    h = `<p class="muted">‘${esc(q)}’ 검색 결과 — 수치 항목 ${res.length}건 · 검사 기록 ${exm.length}건</p>`;
+    if (exm.length) h += `<div class="card"><h3>검사 기록 (${exm.length})</h3>${exm.slice(0, 40).map(e => examRow(e, true)).join('')}${exm.length > 40 ? '<p class="muted small">상위 40건만 표시했어요. 검색어를 더 좁혀 보세요.</p>' : ''}</div>`;
+    h += '<div class="grid">';
     for (const { it, ser } of withData) {
       if (!ser.length) { h += `<div class="card" style="opacity:.6"><h3>${esc(it.name)}</h3><div class="muted small">${esc(refText(it))}</div><p class="muted">기록 없음</p></div>`; continue; }
       const s = stats(it, ser), l = s.last;
@@ -351,6 +422,19 @@ const actions = {
     keys.forEach(k => { const i = document.querySelector(`.vin[data-id="${k}"]`); if (i) { i.value = out[k]; i.dispatchEvent(new Event('input', { bubbles: true })); } });
     toast(`${keys.length}개 항목을 채웠어요${miss ? ` (인식 못한 줄 ${miss})` : ''} — 확인 후 저장하세요`);
   },
+  filterTag(t) { state.examTag = t.dataset.v; render(); },
+  filterKind(t) { const v = t.dataset.v; go('exams', { examKind: state.view === 'exams' && state.examKind === v ? '' : v }); },
+  editExam(t) { go('exams', { editExam: t.dataset.id }); },
+  cancelExam() { state.editExam = null; render(); },
+  saveExam() {
+    const g = id => $(id).value.trim(), year = +g('#ex_year'), kind = g('#ex_kind');
+    if (!year || !kind) return toast('연도와 검사 종류는 꼭 입력하세요');
+    const rec = { year, date: g('#ex_date'), place: g('#ex_place'), kind, tag: g('#ex_tag'), result: g('#ex_result'), due: g('#ex_due') ? +g('#ex_due') : null, note: g('#ex_note') };
+    const list = examList(), ex = list.find(e => e.id === state.editExam);
+    if (ex) Object.assign(ex, rec); else list.push({ id: 'e' + uid(), ...rec });
+    state.editExam = null; save(); render(); toast('검사 기록을 저장했어요');
+  },
+  delExam() { if (confirm('이 검사 기록을 삭제할까요?')) { pdata().exams = examList().filter(e => e.id !== state.editExam); state.editExam = null; save(); render(); } },
   sample() {
     if (hasData() && !confirm('현재 사람의 기존 기록에 샘플 데이터를 덮어씁니다. 계속할까요?')) return;
     const recs = {}; SAMPLE_YEARS.forEach((y, i) => { const values = {}; for (const k in SAMPLE) if (SAMPLE[k][i] != null) values[k] = SAMPLE[k][i]; recs[y] = { date: `${y}-05-20`, values }; });
@@ -387,8 +471,12 @@ $('#file').addEventListener('change', async e => {
   try {
     const r = JSON.parse(await f.text());
     if (!r.profiles || !r.data || !r.profiles.length) throw 0;
-    if (!confirm('현재 데이터를 가져온 파일의 내용으로 바꿉니다. 계속할까요?')) return;
-    S = r; if (!S.profiles.some(p => p.id === S.current)) S.current = S.profiles[0].id; state.sel = null; state.inYear = null; save(); go('summary'); toast('가져왔어요');
+    if (!confirm(`파일의 사람 ${r.profiles.length}명을 추가합니다. (같은 사람이 이미 있으면 파일 내용으로 덮어씁니다.) 계속할까요?`)) return;
+    const empty = p => { const d = S.data[p.id] || {}; return !Object.keys(d.records || {}).length && !(d.custom || []).length && !(d.exams || []).length; };
+    S.profiles = S.profiles.filter(p => !empty(p) || r.profiles.some(q => q.id === p.id));
+    r.profiles.forEach(p => { const i = S.profiles.findIndex(x => x.id === p.id); if (i >= 0) S.profiles[i] = p; else S.profiles.push(p); S.data[p.id] = r.data[p.id] || { records: {}, custom: [], exams: [] }; });
+    S.current = r.profiles.some(p => p.id === r.current) ? r.current : r.profiles[0].id;
+    state.sel = null; state.inYear = null; state.examKind = ''; state.examTag = ''; save(); go('summary'); toast('가져왔어요');
   } catch (err) { toast('올바른 HealthTrack 백업 파일이 아니에요'); }
 });
 

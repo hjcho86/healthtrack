@@ -3,3 +3,4 @@
 # 내보낸 개인 백업 파일이 실수로 올라가지 않도록
 healthtrack-*.json
 healthtrack-*.csv
+private/
