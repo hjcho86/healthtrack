@@ -298,26 +298,52 @@ function defaultYear(ys) {
 const emptyHtml = () => `<div class="card empty"><h2>아직 검진 결과가 없어요</h2><p>‘입력’ 탭에서 연도별 결과를 넣거나, 샘플 데이터로 먼저 둘러보세요.</p><button class="btn pri" data-act="sample">샘플 데이터 불러오기</button> <button class="btn" data-act="goInput">직접 입력하기</button></div>`;
 
 /* ---------- 뷰 ---------- */
+// 요약 화면용 조각들
+const SHORT = { bmi: 'BMI', ggt: 'γ-GTP', alt: 'ALT', ast: 'AST', ldl: 'LDL', hdl: 'HDL', tc: '총콜레스테롤', tg: '중성지방', glucose: '공복혈당', hba1c: '당화혈색소', egfr: 'eGFR', hb: '혈색소', uric: '요산', sbp: '수축기 혈압', dbp: '이완기 혈압', waist: '허리둘레', creat: '크레아티닌' };
+const shortName = it => SHORT[it.id] || it.name;
+const lastOf = ser => ser[ser.length - 1];
+function deltaChip(it, ser) {
+  const s = stats(it, ser); if (!s.prev) return '<span class="flat">–</span>';
+  const d = s.last.value - s.prev.value, cls = s.trend === 'better' ? 'down' : s.trend === 'worse' ? 'up' : 'flat';
+  return `<span class="${cls}" title="전회(${s.prev.year}년) ${fv(it, s.prev.value)}">${d > 0 ? '▲' : d < 0 ? '▼' : '–'} ${fv(it, Math.abs(d))}</span>`;
+}
+const tileHtml = (name, val, unit, st, delta, sp, id) => `<div class="tile ${st}" data-act="detail" data-id="${esc(id)}"><div class="tn">${esc(name)}</div><div class="tv">${esc(val)}<small>${esc(unit)}</small></div><div class="tf">${delta}${sp}</div></div>`;
+const KEY_TILES = ['bp', 'glucose', 'hba1c', 'ldl', 'tg', 'bmi', 'alt', 'ggt', 'hdl', 'tc', 'egfr', 'hb', 'uric'];
+
 const views = {
   summary() {
     if (!hasData()) return upHtml() + emptyHtml();
     const ys = years(); const Y = ys.includes(state.sumYear) ? state.sumYear : defaultYear(ys);
     const rec = pdata().records[Y], idx = ys.indexOf(Y);
-    const all = items().map(it => ({ it, ser: series(it).filter(p => p.year <= Y) })).filter(x => x.ser.length && x.ser[x.ser.length - 1].year === Y);
+    const all = items().map(it => ({ it, ser: series(it).filter(p => p.year <= Y) })).filter(x => x.ser.length && lastOf(x.ser).year === Y);
     const cnt = { ok: 0, warn: 0, bad: 0 };
-    all.forEach(x => { const st = x.ser[x.ser.length - 1].status; if (cnt[st] != null) cnt[st]++; });
-    const need = all.filter(x => ['warn', 'bad'].includes(x.ser[x.ser.length - 1].status)).sort((a, b) => RANK[b.ser[b.ser.length - 1].status] - RANK[a.ser[a.ser.length - 1].status]);
-    const better = all.filter(x => stats(x.it, x.ser).trend === 'better'), worse = all.filter(x => stats(x.it, x.ser).trend === 'worse');
+    all.forEach(x => { const st = lastOf(x.ser).status; if (cnt[st] != null) cnt[st]++; });
+    const judged = cnt.ok + cnt.warn + cnt.bad, attn = cnt.warn + cnt.bad;
+    const need = all.filter(x => ['warn', 'bad'].includes(lastOf(x.ser).status)).sort((a, b) => RANK[lastOf(b.ser).status] - RANK[lastOf(a.ser).status]);
+    const better = all.filter(x => stats(x.it, x.ser).trend === 'better').length, worse = all.filter(x => stats(x.it, x.ser).trend === 'worse').length;
     const rows = ys.map(y => { const c = { year: y, ok: 0, warn: 0, bad: 0 }; items().forEach(it => { const p = series(it).find(p => p.year === y); if (p && c[p.status] != null) c[p.status]++; }); return c; });
-    return `<div class="card"><div class="row"><h2 style="margin:0">${Y}년 검진 요약</h2>${rec.date ? `<span class="muted small">${esc(rec.date)}</span>` : ''}<span class="sp"></span>
+    const seg = (k, n) => n ? `<span class="s ${k}" style="flex:${n}">${LABEL[k]} ${n}</span>` : '';
+    const hero = `<div class="card hero"><div class="row"><h2 style="margin:0">${Y}년 검진</h2>${rec.date ? `<span class="muted small">${esc(rec.date)}</span>` : ''}<span class="sp"></span>
       <select data-chg="sumYear">${ys.slice().reverse().map(y => `<option ${y === Y ? 'selected' : ''}>${y}</option>`).join('')}</select></div>
-      <div class="cnt" style="margin-top:12px"><div class="ok"><b>${cnt.ok}</b>정상</div><div class="warn"><b>${cnt.warn}</b>주의</div><div class="bad"><b>${cnt.bad}</b>이상</div></div>
-      ${idx > 0 ? `<p class="muted small" style="margin:10px 0 0">전회(${ys[idx - 1]}년) 대비 판정이 좋아진 항목 <b class="down">${better.length}</b>개 · 나빠진 항목 <b class="up">${worse.length}</b>개</p>` : ''}</div>
-      ${upHtml()}
-      <div class="card"><h3>관리가 필요한 항목 (${need.length})</h3>${need.length ? `<div class="list">${need.map(x => rowHtml(x.it, x.ser)).join('')}</div>` : '<p class="muted">주의·이상 항목이 없어요 👍</p>'}</div>
-      ${worse.length ? `<div class="card"><h3>전회보다 나빠진 항목</h3><div class="list">${worse.map(x => rowHtml(x.it, x.ser)).join('')}</div></div>` : ''}
-      ${better.length ? `<div class="card"><h3>전회보다 좋아진 항목</h3><div class="list">${better.map(x => rowHtml(x.it, x.ser)).join('')}</div></div>` : ''}
-      <div class="card"><h3>연도별 판정 분포</h3>${stackChart(rows)}</div>`;
+      <div class="hl">${judged ? (attn ? `${judged}개 항목 중 <b>${attn}개</b>를 확인해야 해요` : `${judged}개 항목이 모두 정상이에요 👍`) : '판정할 수 있는 항목이 없어요'}</div>
+      ${judged ? `<div class="sbar">${seg('ok', cnt.ok)}${seg('warn', cnt.warn)}${seg('bad', cnt.bad)}</div>` : ''}
+      ${idx > 0 ? `<div class="small muted" style="margin-top:8px">전회(${ys[idx - 1]}년) 대비 &nbsp;좋아진 항목 <b class="down">${better}</b> · 나빠진 항목 <b class="up">${worse}</b></div>` : ''}</div>`;
+    const tiles = [];
+    for (const id of KEY_TILES) {
+      if (tiles.length >= 8) break;
+      if (id === 'bp') {
+        const a = all.find(x => x.it.id === 'sbp'), b = all.find(x => x.it.id === 'dbp');
+        if (a && b) { const la = lastOf(a.ser), lb = lastOf(b.ser); tiles.push(tileHtml('혈압', `${fmt(la.value, 0)}/${fmt(lb.value, 0)}`, 'mmHg', (RANK[la.status] || 0) >= (RANK[lb.status] || 0) ? la.status : lb.status, deltaChip(a.it, a.ser), spark(a.ser, a.it), 'sbp')); }
+        continue;
+      }
+      const x = all.find(x => x.it.id === id); if (!x) continue;
+      const l = lastOf(x.ser); tiles.push(tileHtml(shortName(x.it), fv(x.it, l.value), x.it.unit, l.status, deltaChip(x.it, x.ser), spark(x.ser, x.it), id));
+    }
+    const up = upcoming();
+    const todo = up.slice(0, 4).map(u => { const { lab, cls } = dueLabel(u); return `<div class="it" data-act="filterKind" data-v="${esc(u.kind)}"><div class="nm">${esc(u.kind)}</div><span class="badge ${cls}">${lab}</span></div>`; }).join('');
+    const two = `<div class="two"><div class="card"><div class="row"><h3 style="margin:0">지금 챙길 것</h3><span class="sp"></span>${up.length > 4 ? `<a href="#" data-act="goExams" class="small">전체 ${up.length}건 →</a>` : ''}</div>${todo ? `<div class="list" style="margin-top:6px">${todo}</div>` : '<p class="muted">받을 검사 알림이 없어요 👍</p>'}</div>
+      <div class="card"><h3>주의·이상 항목 (${need.length})</h3>${need.length ? `<div class="pills">${need.map(x => { const l = lastOf(x.ser); return `<span class="pill ${l.status}" data-act="detail" data-id="${esc(x.it.id)}">${esc(shortName(x.it))} <b>${fv(x.it, l.value)}</b></span>`; }).join('')}</div>` : '<p class="muted">없어요 👍</p>'}</div></div>`;
+    return `${hero}${tiles.length ? `<div class="tiles">${tiles.join('')}</div>` : ''}${two}<div class="card"><h3>연도별 판정 분포</h3>${stackChart(rows)}</div>`;
   },
   table() {
     if (!hasData()) return emptyHtml();
@@ -569,6 +595,7 @@ const actions = {
     keys.forEach(k => { const i = document.querySelector(`.vin[data-id="${k}"]`); if (i) { i.value = out[k]; i.dispatchEvent(new Event('input', { bubbles: true })); } });
     toast(`${keys.length}개 항목을 채웠어요${miss ? ` (인식 못한 줄 ${miss})` : ''} — 확인 후 저장하세요`);
   },
+  goExams(t, e) { go('exams'); },
   filterTag(t) { state.examTag = t.dataset.v; render(); },
   filterPlace(t) { state.examPlace = state.examPlace === t.dataset.v ? '' : t.dataset.v; render(); },
   pickSym(t) { state.gsym = state.gsym === t.dataset.v ? '' : t.dataset.v; render(); },
