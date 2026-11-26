@@ -4,3 +4,6 @@
 healthtrack-*.json
 healthtrack-*.csv
 private/
+.wrangler/
+node_modules/
+.dev.vars

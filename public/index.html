@@ -14,12 +14,13 @@
     <h1><img class="logo" src="icon.svg" alt="" width="28" height="28"> HealthTrack</h1>
     <select id="prof" aria-label="사람 선택"></select>
     <button id="lockbtn" class="btn small" hidden title="이 사람의 기록을 다시 잠급니다">🔒 잠그기</button>
+    <span id="sync" class="sync"></span>
     <input id="q" type="search" placeholder="검사 검색  예) 콜레스테롤 · LDL · 간 · ㅎㅇ · 2023 · 주의" autocomplete="off">
   </div>
   <nav id="tabs"></nav>
 </header>
 <main id="main"></main>
-<footer>데이터는 이 브라우저에만 저장되며 서버로 전송되지 않습니다. 기준치는 일반 참고용이며 진단이 아닙니다.</footer>
+<footer>기록은 비밀번호로 암호화되어 서버에 저장되며, 서버는 비밀번호와 기록 내용을 알 수 없습니다. 기준치는 일반 참고용이며 진단이 아닙니다.</footer>
 <div id="toast"></div>
 <input type="file" id="file" accept="application/json" hidden>
 <script src="catalog.js"></script>

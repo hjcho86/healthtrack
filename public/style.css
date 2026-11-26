@@ -92,3 +92,6 @@ td.ok,td.warn,td.bad{font-size:12px}
 .exh{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .btn.small{padding:1px 10px;font-size:12px}
 summary{cursor:pointer}
+
+.sync{font-size:12px;color:var(--muted);white-space:nowrap}
+.sync.ok{color:var(--ok)}.sync.bad{color:var(--bad)}

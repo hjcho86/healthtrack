@@ -2,60 +2,83 @@
 'use strict';
 const $ = (s, r = document) => r.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const KEY = 'healthtrack.v1';
+const KEY = 'healthtrack.v2', OLD_KEY = 'healthtrack.v1', DEFAULT_NAMES = ['쭌', '쏘'];
 const LABEL = { ok: '정상', warn: '주의', bad: '이상', none: '-' };
 const RANK = { ok: 0, warn: 1, bad: 2 };
 const uid = () => Math.random().toString(36).slice(2, 9);
 
-/* ---------- 저장소 ---------- */
-// S.data[id] = 평문 데이터(잠금 안 된 사람, 또는 잠금을 푼 동안의 메모리). 잠긴 사람은 S.blobs[id]에 암호문으로만 저장된다.
-function fresh() { const id = uid(); return { profiles: [{ id, name: '쭌', sex: 'M' }], current: id, data: { [id]: { records: {}, custom: [], exams: [] } }, blobs: {}, mig1: true }; }
+/* ---------- 저장소: 서버(Cloudflare D1)에 암호문으로 저장 ---------- */
+// 서버는 비밀번호도 평문 기록도 알지 못한다. 브라우저에서 비밀번호로 암호화한 덩어리(blob)만 저장한다.
 function load() {
   try {
     const r = JSON.parse(localStorage.getItem(KEY));
-    if (r && r.profiles && r.profiles.length && r.data) {
-      r.blobs ||= {};
-      if (!r.mig1) { r.profiles.forEach(p => { if (p.name === '나') p.name = '쭌'; }); r.mig1 = true; } // 기본 사람 '나' → '쭌' (1회)
-      return r;
-    }
+    if (r && Array.isArray(r.profiles) && r.profiles.length) return { profiles: r.profiles.map(p => ({ id: p.id, name: p.name })), current: r.profiles.some(p => p.id === r.current) ? r.current : r.profiles[0].id, data: {}, acct: {} };
   } catch (e) {}
-  return fresh();
+  return { profiles: DEFAULT_NAMES.map(n => ({ id: n, name: n })), current: DEFAULT_NAMES[0], data: {}, acct: {} };
 }
 let S = load();
-const keys = {}; // 잠금을 푼 사람의 키(메모리에만 보관, 새로고침하면 다시 잠김)
+function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify({ profiles: S.profiles.map(p => ({ id: p.id, name: p.name })), current: S.current })); } catch (e) {} }
+const keys = {}; // 로그인한 사람의 키·토큰(메모리에만 보관, 새로고침하면 다시 로그인)
 
 /* ---------- 암호화 (PBKDF2 → AES-GCM) ---------- */
 const ITER = 200000;
+const te = new TextEncoder();
 const b64e = u8 => { let s = ''; u8.forEach(b => s += String.fromCharCode(b)); return btoa(s); };
 const b64d = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const rand = n => crypto.getRandomValues(new Uint8Array(n));
 async function deriveKey(pass, salt, iter) {
-  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+  const km = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
+// 서버 로그인용 토큰: 암호화 키와는 별개로 비밀번호에서 한 번 더 유도한다(서버는 토큰의 해시만 저장)
+async function makeToken(pass, authSalt) {
+  const km = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveBits']);
+  return b64e(new Uint8Array(await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: te.encode('auth|' + authSalt), iterations: ITER, hash: 'SHA-256' }, km, 256)));
+}
 async function encData(k, obj) {
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k.key, new TextEncoder().encode(JSON.stringify(obj))));
+  const iv = rand(12);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, k.key, te.encode(JSON.stringify(obj))));
   return { s: b64e(k.salt), i: b64e(iv), c: b64e(ct), n: k.iter };
 }
 async function decData(key, blob) {
   const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(blob.i) }, key, b64d(blob.c));
   return JSON.parse(new TextDecoder().decode(pt));
 }
-// 저장·내보내기용 스냅샷: 잠긴 사람은 암호문만 포함
-async function snapshot() {
-  const out = { profiles: S.profiles, current: S.current, data: {}, blobs: { ...S.blobs }, mig1: true };
-  for (const p of S.profiles) {
-    if (p.locked) { const k = keys[p.id]; if (k && S.data[p.id]) out.blobs[p.id] = S.blobs[p.id] = await encData(k, S.data[p.id]); }
-    else out.data[p.id] = S.data[p.id];
-  }
-  return out;
+
+/* ---------- 서버 통신·저장 ---------- */
+async function api(method, path, body) {
+  let r;
+  try { r = await fetch(path, { method, headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }); }
+  catch (e) { const er = new Error('network'); er.status = 0; throw er; }
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) { const er = new Error(j.error || 'http_' + r.status); er.status = r.status; er.data = j; throw er; }
+  return j;
 }
-let saveQ = Promise.resolve();
+const dirty = new Set(); let saveQ = Promise.resolve(), saveT = 0;
+function setSync(t, cls) { const el = $('#sync'); if (el) { el.textContent = t; el.className = 'sync ' + (cls || ''); } }
+function save() { dirty.add(S.current); setSync('저장 대기…'); clearTimeout(saveT); saveT = setTimeout(persist, 700); }
 function persist() {
-  saveQ = saveQ.then(async () => { localStorage.setItem(KEY, JSON.stringify(await snapshot())); }).catch(() => toast('저장 실패: 브라우저 저장소를 쓸 수 없어요'));
+  clearTimeout(saveT);
+  saveQ = saveQ.then(async () => {
+    for (const id of [...dirty]) {
+      const k = keys[id], data = S.data[id];
+      if (!k || !data) { dirty.delete(id); continue; }
+      setSync('저장 중…');
+      try {
+        data.sex = (S.profiles.find(p => p.id === id) || {}).sex || 'M';
+        const r = await api('PUT', '/api/data', { name: id, token: k.token, blob: JSON.stringify(await encData(k, data)), version: k.version });
+        k.version = r.version; dirty.delete(id);
+      } catch (e) {
+        setSync('⚠ 저장 실패', 'bad');
+        toast(e.status === 409 ? '다른 기기에서 먼저 수정했어요. 새로고침 후 다시 로그인해서 입력하세요' : e.status === 0 ? '서버에 연결할 수 없어요. 저장되지 않았어요' : '서버 저장 실패: ' + e.message);
+        return;
+      }
+    }
+    setSync('☁ 저장됨', 'ok');
+  });
   return saveQ;
 }
-const save = () => { persist(); };
+window.addEventListener('beforeunload', e => { if (dirty.size) { e.preventDefault(); e.returnValue = ''; } });
 const prof = () => S.profiles.find(p => p.id === S.current) || S.profiles[0];
 const pdata = () => (S.data[prof().id] ||= { records: {}, custom: [], exams: [] });
 const examList = () => (pdata().exams ||= []);
@@ -391,17 +414,19 @@ const views = {
   },
   data() {
     const p = prof(), cu = pdata().custom || [];
-    return `<div class="card"><h3>사람(프로필)</h3><p class="muted small">성별에 따라 일부 기준치(γ-GTP, 혈색소, 허리둘레, 요산)가 달라집니다. 가족 등 여러 명을 따로 관리할 수 있어요.</p>
-      <div class="row"><input type="text" id="pn" value="${esc(p.name)}" style="width:140px"><select id="ps"><option value="M" ${p.sex === 'M' ? 'selected' : ''}>남성</option><option value="F" ${p.sex === 'F' ? 'selected' : ''}>여성</option></select>
-      <button class="btn" data-act="saveProf">저장</button><span class="sp"></span><button class="btn" data-act="addProf">+ 사람 추가</button>${S.profiles.length > 1 ? '<button class="btn del" data-act="delProf">이 사람 삭제</button>' : ''}</div></div>
-    <div class="card"><h3>비밀번호 잠금 — ${esc(p.name)} ${p.locked ? '<span class="badge ok">잠금 설정됨</span>' : '<span class="badge none">잠금 없음</span>'}</h3>
-      <p class="muted small">비밀번호로 이 사람의 기록을 <b>암호화</b>해서 저장합니다. 사람을 바꾸거나 새로고침하면 다시 잠기고, 비밀번호가 맞아야 보입니다. 비밀번호는 어디에도 저장되지 않으며 <b>잊으면 복구할 수 없어요.</b> 숫자 몇 자리는 추측되기 쉬우니 민감한 기록은 더 긴 비밀번호를 권장합니다.</p>
-      <div class="row"><input type="password" id="lp1" placeholder="새 비밀번호" autocomplete="new-password" style="width:150px"><input type="password" id="lp2" placeholder="한 번 더" autocomplete="new-password" style="width:150px"><button class="btn" data-act="setLock">${p.locked ? '비밀번호 변경' : '잠금 설정'}</button>${p.locked ? '<button class="btn" data-act="relock">지금 잠그기</button><button class="btn del" data-act="removeLock">잠금 해제(암호 제거)</button>' : ''}</div></div>
+    return `<div class="card"><h3>사람(계정)</h3><p class="muted small">각 사람의 기록은 비밀번호로 <b>암호화되어 서버에 저장</b>됩니다. 성별에 따라 일부 기준치(γ-GTP, 혈색소, 허리둘레, 요산)가 달라집니다.</p>
+      <div class="row"><b>${esc(p.name)}</b><select id="ps"><option value="M" ${p.sex === 'M' ? 'selected' : ''}>남성</option><option value="F" ${p.sex === 'F' ? 'selected' : ''}>여성</option></select>
+      <button class="btn" data-act="saveProf">성별 저장</button><span class="sp"></span><button class="btn" data-act="addProf">+ 이름 추가</button><button class="btn del" data-act="delProf">목록에서 빼기</button></div></div>
+    <div class="card"><h3>비밀번호 변경 — ${esc(p.name)}</h3>
+      <p class="muted small">비밀번호는 서버에 저장되지 않고, 이 비밀번호로 기록이 암호화됩니다. <b>잊으면 복구할 수 없어요.</b> 숫자 몇 자리는 추측되기 쉬우니 민감한 기록은 더 긴 비밀번호를 권장합니다.</p>
+      <div class="row"><input type="password" id="lp1" placeholder="새 비밀번호" autocomplete="new-password" style="width:150px"><input type="password" id="lp2" placeholder="한 번 더" autocomplete="new-password" style="width:150px"><button class="btn" data-act="changePw">비밀번호 변경</button><span class="sp"></span><button class="btn" data-act="relock">지금 잠그기</button></div></div>
+    ${legacyProfiles().length ? `<div class="card"><h3>이 브라우저에 남아 있는 예전 기록</h3><p class="muted small">서버 저장 방식으로 바꾸기 전에 이 브라우저에만 저장돼 있던 기록이에요. 현재 사람(${esc(p.name)})의 서버 기록으로 옮길 수 있어요.</p>
+      <div class="row">${legacyProfiles().map(x => `<button class="btn" data-act="legacy" data-id="${esc(x.id)}">‘${esc(x.name)}’ 기록 옮기기</button>`).join('')}<span class="sp"></span><button class="btn del" data-act="legacyDel">예전 기록 삭제</button></div></div>` : ''}
     <div class="card"><h3>사용자 항목 추가</h3><p class="muted small">카탈로그에 없는 검사(예: 비타민D, PSA)를 직접 추가합니다.</p>
       <div class="row"><input type="text" id="cn" placeholder="항목명" style="width:150px"><input type="text" id="cu" placeholder="단위" style="width:90px"><input type="number" step="any" id="cmin" placeholder="정상 하한" style="width:100px"><input type="number" step="any" id="cmax" placeholder="정상 상한" style="width:100px"><button class="btn" data-act="addCustom">추가</button></div>
       ${cu.length ? `<div class="chips" style="margin-top:10px">${cu.map(c => `<span class="chip">${esc(c.name)} <span data-act="delCustom" data-id="${esc(c.id)}" title="삭제">✕</span></span>`).join('')}</div>` : ''}</div>
-    <div class="card"><h3>데이터 백업·이전</h3><p class="muted small">기기를 바꾸거나 브라우저 데이터를 지우기 전에 반드시 내보내기로 백업하세요.</p>
-      <div class="row"><button class="btn" data-act="exportJson">전체 JSON 내보내기</button><button class="btn" data-act="exportCsv">현재 사람 CSV 내보내기</button><button class="btn" data-act="importJson">JSON 가져오기</button><span class="sp"></span><button class="btn" data-act="sample">샘플 데이터 넣기</button><button class="btn del" data-act="wipe">전체 삭제</button></div></div>`;
+    <div class="card"><h3>백업·이전</h3><p class="muted small">기록은 서버에 암호화되어 저장됩니다. 내보내기 파일은 <b>암호화되지 않은 평문</b>이니 보관에 주의하세요.</p>
+      <div class="row"><button class="btn" data-act="exportJson">내 기록 JSON 내보내기(평문)</button><button class="btn" data-act="exportCsv">CSV 내보내기</button><button class="btn" data-act="importJson">JSON 가져오기</button><span class="sp"></span><button class="btn" data-act="sample">샘플 데이터 넣기</button><button class="btn del" data-act="wipe">이 사람 기록 전체 삭제</button></div></div>`;
   },
 };
 
@@ -409,19 +434,32 @@ const views = {
 function render() {
   $('#prof').innerHTML = S.profiles.map(p => `<option value="${p.id}" ${p.id === S.current ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
   $('#tabs').innerHTML = TABS.map(([k, n]) => `<button data-tab="${k}" class="${state.view === k || (state.view === 'detail' && state.from === k) ? 'on' : ''}">${n}</button>`).join('');
-  $('#lockbtn').hidden = !(prof().locked && keys[prof().id]);
+  $('#lockbtn').hidden = isLocked();
   $('#main').innerHTML = isLocked() ? lockHtml() : views[state.view]();
-  const pw = $('#pw'); if (pw && document.activeElement !== $('#q')) pw.focus();
+  if (isLocked() && S.acct[prof().id] === undefined) loadAcct();
+  const pw = $('#pw') || $('#pw1'); if (pw && document.activeElement !== $('#q')) pw.focus();
 }
-const isLocked = () => !!prof().locked && !keys[prof().id];
-const lockHtml = () => `<div class="card empty" style="max-width:380px;margin:40px auto"><div style="font-size:40px">🔒</div><h2 style="margin:6px 0">‘${esc(prof().name)}’의 기록은 잠겨 있어요</h2>
-  ${S.blobs[prof().id] ? `<p class="muted small">비밀번호를 입력하면 기록을 보여드려요.</p><input type="password" id="pw" inputmode="numeric" autocomplete="off" placeholder="비밀번호" style="width:100%;text-align:center;font-size:18px;margin:8px 0"><button class="btn pri" style="width:100%" data-act="unlock">열기</button>` : '<p class="muted">저장된 암호화 데이터가 없어요.</p>'}
-  <p style="margin-top:18px"><a href="#" class="muted small" data-act="delLocked">비밀번호를 잊었어요 (이 사람 삭제)</a></p></div>`;
+const isLocked = () => !keys[prof().id];
+function lockHtml() {
+  const p = prof(), st = S.acct[p.id];
+  let body;
+  if (st === 'unclaimed') body = `<p class="muted small">처음 사용하는 이름이에요. 이 사람의 비밀번호를 정하세요. 기록은 이 비밀번호로 암호화되어 서버에 저장되고, <b>잊으면 복구할 수 없어요.</b></p><input type="password" id="pw1" placeholder="새 비밀번호 (4자 이상)" autocomplete="new-password" style="width:100%;text-align:center;margin:6px 0"><input type="password" id="pw2" placeholder="한 번 더" autocomplete="new-password" style="width:100%;text-align:center;margin:6px 0"><button class="btn pri" style="width:100%" data-act="claim">비밀번호 정하고 시작</button>`;
+  else if (st === 'error') body = `<p class="muted">서버에 연결하지 못했어요.</p><button class="btn" data-act="retryAcct">다시 시도</button>`;
+  else if (st === 'claimed') body = `<p class="muted small">비밀번호를 입력하면 서버에 저장된 기록을 불러옵니다.</p><input type="password" id="pw" inputmode="numeric" autocomplete="off" placeholder="비밀번호" style="width:100%;text-align:center;font-size:18px;margin:8px 0"><button class="btn pri" style="width:100%" data-act="unlock">열기</button>`;
+  else body = '<p class="muted">서버 확인 중…</p>';
+  return `<div class="card empty" style="max-width:380px;margin:40px auto"><div style="font-size:40px">🔒</div><h2 style="margin:6px 0">‘${esc(p.name)}’</h2>${body}<p style="margin-top:18px"><a href="#" class="muted small" data-act="delLocked">이 이름을 목록에서 빼기</a></p></div>`;
+}
+async function loadAcct() {
+  const id = prof().id;
+  try { const r = await api('GET', '/api/salt?name=' + encodeURIComponent(id)); S.acct[id] = r.unclaimed ? 'unclaimed' : 'claimed'; }
+  catch (e) { S.acct[id] = 'error'; }
+  if (prof().id === id) render();
+}
 function go(view, extra = {}) { Object.assign(state, extra); state.view = view; if (view !== 'search') { state.q = ''; $('#q').value = ''; } render(); window.scrollTo(0, 0); }
 
 /* ---------- 이벤트 ---------- */
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('[data-tab]'); if (b) { if (b.dataset.tab === 'input') state.inYear = null; go(b.dataset.tab); } });
-$('#prof').addEventListener('change', e => { S.current = e.target.value; state.sel = null; state.inYear = null; save(); render(); });
+$('#prof').addEventListener('change', e => { S.current = e.target.value; state.sel = null; state.inYear = null; state.examKind = ''; state.examTag = ''; saveLocal(); render(); });
 $('#q').addEventListener('input', e => {
   state.q = e.target.value;
   if (state.q.trim()) { if (state.view !== 'search') state.from = state.view === 'detail' ? state.from : state.view; state.view = 'search'; }
@@ -490,56 +528,96 @@ const actions = {
     const recs = {}; SAMPLE_YEARS.forEach((y, i) => { const values = {}; for (const k in SAMPLE) if (SAMPLE[k][i] != null) values[k] = SAMPLE[k][i]; recs[y] = { date: `${y}-05-20`, values }; });
     pdata().records = recs; state.sel = null; state.inYear = null; save(); go('summary'); toast('샘플 데이터를 불러왔어요');
   },
-  saveProf() { const p = prof(); p.name = $('#pn').value.trim() || p.name; p.sex = $('#ps').value; save(); render(); toast('저장했어요'); },
-  addProf() { const name = prompt('추가할 사람 이름'); if (!name) return; const id = uid(); S.profiles.push({ id, name: name.trim(), sex: 'M' }); S.data[id] = { records: {}, custom: [] }; S.current = id; state.sel = null; state.inYear = null; save(); render(); toast('성별은 아래에서 확인하세요'); },
+  saveProf() { prof().sex = $('#ps').value; save(); render(); toast('저장했어요'); },
+  addProf() {
+    const name = (prompt('추가할 이름(서버에 이미 만들어 둔 계정 이름)') || '').trim(); if (!name) return;
+    if (!S.profiles.some(p => p.id === name)) S.profiles.push({ id: name, name });
+    S.current = name; state.sel = null; state.inYear = null; saveLocal(); render();
+  },
   delProf() {
-    if (S.profiles.length < 2) return toast('마지막 한 명은 삭제할 수 없어요');
-    if (!confirm(`‘${prof().name}’의 모든 기록을 삭제할까요?`)) return;
-    const id = prof().id; S.profiles = S.profiles.filter(p => p.id !== id); delete S.data[id]; delete S.blobs[id]; delete keys[id];
-    S.current = S.profiles[0].id; state.sel = null; save(); render();
+    if (S.profiles.length < 2) return toast('마지막 한 명은 목록에서 뺄 수 없어요');
+    if (!confirm(`‘${prof().name}’을(를) 이 브라우저의 목록에서 뺄까요? (서버에 저장된 기록은 지워지지 않아요)`)) return;
+    const id = prof().id; S.profiles = S.profiles.filter(p => p.id !== id); delete S.data[id]; delete keys[id]; delete S.acct[id];
+    S.current = S.profiles[0].id; state.sel = null; saveLocal(); render();
   },
   delLocked(t, e) { e && e.preventDefault(); actions.delProf(); },
+  retryAcct() { S.acct[prof().id] = undefined; render(); },
   async unlock() {
-    const p = prof(), b = S.blobs[p.id], pw = $('#pw').value; if (!pw || !b) return;
+    const p = prof(), pw = ($('#pw') || {}).value; if (!pw) return;
+    toast('확인 중…');
     try {
-      const salt = b64d(b.s), iter = b.n || ITER, key = await deriveKey(pw, salt, iter);
-      const data = await decData(key, b);
-      keys[p.id] = { key, salt, iter }; S.data[p.id] = data; state.sel = null; state.inYear = null; state.sumYear = null; render(); toast('잠금을 풀었어요');
-    } catch (err) {
-      await new Promise(r => setTimeout(r, 700)); const el = $('#pw'); if (el) { el.value = ''; el.focus(); } toast('비밀번호가 맞지 않아요');
+      const s = await api('GET', '/api/salt?name=' + encodeURIComponent(p.id));
+      const token = await makeToken(pw, s.authSalt);
+      const r = await api('POST', '/api/login', { name: p.id, token });
+      const blob = JSON.parse(r.blob), salt = b64d(blob.s), iter = blob.n || ITER;
+      const key = await deriveKey(pw, salt, iter), data = await decData(key, blob);
+      keys[p.id] = { key, salt, iter, token, version: r.version, authSalt: s.authSalt };
+      S.data[p.id] = data; p.sex = data.sex || 'M'; state.sel = null; state.inYear = null; state.sumYear = null;
+      setSync('☁ 서버와 연결됨', 'ok'); render(); toast('불러왔어요');
+    } catch (e) {
+      if (e.status === 429) toast(`시도가 너무 많아요. ${e.data.retry}초 뒤에 다시 해보세요`);
+      else if (e.status === 0) toast('서버에 연결할 수 없어요');
+      else { await new Promise(r => setTimeout(r, 600)); toast('비밀번호가 맞지 않아요'); }
+      const el = $('#pw'); if (el) { el.value = ''; el.focus(); }
     }
   },
-  async relock() { const id = prof().id; await persist(); delete keys[id]; delete S.data[id]; state.view = 'summary'; render(); toast('잠갔어요'); },
-  async setLock() {
-    const a = $('#lp1').value, b = $('#lp2').value;
+  async claim() {
+    const p = prof(), a = $('#pw1').value, b = $('#pw2').value;
     if (a.length < 4) return toast('비밀번호는 4자 이상으로 하세요');
     if (a !== b) return toast('두 비밀번호가 달라요');
-    if (!confirm(`‘${prof().name}’의 기록을 이 비밀번호로 암호화합니다. 비밀번호를 잊으면 복구할 수 없어요. 계속할까요?`)) return;
-    const p = prof(), salt = crypto.getRandomValues(new Uint8Array(16));
-    keys[p.id] = { key: await deriveKey(a, salt, ITER), salt, iter: ITER }; p.locked = true;
-    await persist(); render(); toast('잠금을 설정했어요');
+    toast('만드는 중…');
+    try {
+      const authSalt = b64e(rand(16)), token = await makeToken(a, authSalt), salt = rand(16);
+      const k = { key: await deriveKey(a, salt, ITER), salt, iter: ITER, token, version: 0, authSalt };
+      const data = { records: {}, custom: [], exams: [], sex: 'M' };
+      const r = await api('POST', '/api/claim', { name: p.id, token, authSalt, blob: JSON.stringify(await encData(k, data)) });
+      k.version = r.version; keys[p.id] = k; S.data[p.id] = data; S.acct[p.id] = 'claimed'; p.sex = 'M'; setSync('☁ 저장됨', 'ok'); render(); toast('비밀번호를 정했어요');
+    } catch (e) { toast(e.status === 409 ? '이미 다른 사람이 비밀번호를 정한 이름이에요' : '실패: ' + e.message); S.acct[p.id] = undefined; render(); }
   },
-  async removeLock() {
-    if (!confirm('비밀번호를 없애고 암호화를 해제합니다. 계속할까요?')) return;
-    const p = prof(); p.locked = false; delete S.blobs[p.id]; delete keys[p.id]; await persist(); render(); toast('잠금을 해제했어요');
+  async relock() {
+    const id = prof().id; await persist();
+    if (dirty.has(id) && !confirm('서버에 저장되지 않은 변경이 있어요. 그래도 잠글까요?')) return;
+    delete keys[id]; delete S.data[id]; dirty.delete(id); state.view = 'summary'; render(); toast('잠갔어요');
   },
+  async changePw() {
+    const p = prof(), k = keys[p.id], a = $('#lp1').value, b = $('#lp2').value;
+    if (a.length < 4) return toast('비밀번호는 4자 이상으로 하세요');
+    if (a !== b) return toast('두 비밀번호가 달라요');
+    if (!confirm('비밀번호를 바꿉니다. 새 비밀번호를 잊으면 복구할 수 없어요. 계속할까요?')) return;
+    try {
+      await persist();
+      const authSalt = b64e(rand(16)), token = await makeToken(a, authSalt), salt = rand(16);
+      const nk = { key: await deriveKey(a, salt, ITER), salt, iter: ITER, token, version: k.version, authSalt };
+      S.data[p.id].sex = p.sex;
+      const r = await api('POST', '/api/password', { name: p.id, token: k.token, newToken: token, newAuthSalt: authSalt, blob: JSON.stringify(await encData(nk, S.data[p.id])), version: k.version });
+      nk.version = r.version; keys[p.id] = nk; render(); toast('비밀번호를 바꿨어요');
+    } catch (e) { toast('변경 실패: ' + e.message); }
+  },
+  legacy(t) {
+    const src = legacyProfiles().find(x => x.id === t.dataset.id); if (!src) return;
+    const d = pdata(), had = Object.keys(d.records || {}).length + (d.exams || []).length;
+    if (had && !confirm(`현재 ‘${prof().name}’에 이미 기록이 있어요. 예전 기록으로 덮어쓸까요?`)) return;
+    S.data[prof().id] = { records: src.data.records || {}, custom: src.data.custom || [], exams: src.data.exams || [] };
+    save(); go('summary'); toast('서버로 옮겼어요. 아래 ‘예전 기록 삭제’로 이 브라우저의 사본을 지우세요');
+  },
+  legacyDel() { if (confirm('이 브라우저에 남은 예전(서버 이전) 기록을 지울까요? 서버로 옮긴 기록은 그대로예요.')) { try { localStorage.removeItem(OLD_KEY); } catch (e) {} render(); } },
   addCustom() {
     const name = $('#cn').value.trim(); if (!name) return toast('항목명을 입력하세요');
     const num = id => { const v = $(id).value; return v === '' ? null : +v; };
     pdata().custom.push({ id: 'c_' + uid(), name, unit: $('#cu').value.trim(), min: num('#cmin'), max: num('#cmax') }); save(); render(); toast('추가했어요. 입력 탭에서 값을 넣으세요');
   },
   delCustom(t) { if (confirm('이 사용자 항목과 입력된 값을 삭제할까요?')) { const id = t.dataset.id; pdata().custom = pdata().custom.filter(c => c.id !== id); for (const y in pdata().records) delete pdata().records[y].values[id]; save(); render(); } },
-  async exportJson() { download(`healthtrack-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(await snapshot(), null, 1), 'application/json'); },
+  exportJson() { download(`healthtrack-${prof().name}-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify({ format: 'healthtrack-profile', name: prof().name, sex: prof().sex, data: pdata() }, null, 1), 'application/json'); },
   exportCsv() {
     const ys = years(); const rows = [['항목', '단위', ...ys]];
     items().forEach(it => { const ser = series(it); if (ser.length) rows.push([it.name, it.unit, ...ys.map(y => { const p = ser.find(p => p.year === y); return p ? fv(it, p.value) : ''; })]); });
     download(`healthtrack-${prof().name}.csv`, '﻿' + rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n'), 'text/csv');
   },
   importJson() { $('#file').click(); },
-  wipe() { if (confirm('모든 사람의 모든 데이터를 삭제합니다. 되돌릴 수 없어요. 계속할까요?')) { S = fresh(); Object.keys(keys).forEach(k => delete keys[k]); state.sel = null; state.inYear = null; save(); go('summary'); } },
+  wipe() { if (confirm(`‘${prof().name}’의 기록을 모두 지웁니다(서버에 저장된 것도 지워져요). 되돌릴 수 없어요. 계속할까요?`)) { S.data[prof().id] = { records: {}, custom: [], exams: [] }; state.sel = null; state.inYear = null; save(); go('summary'); } },
 };
 $('#main').addEventListener('click', e => { const t = e.target.closest('[data-act]'); if (t && actions[t.dataset.act]) actions[t.dataset.act](t, e); });
-$('#main').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'pw') actions.unlock(); });
+$('#main').addEventListener('keydown', e => { if (e.key !== 'Enter') return; if (e.target.id === 'pw') actions.unlock(); else if (e.target.id === 'pw2') actions.claim(); });
 $('#lockbtn').addEventListener('click', () => actions.relock());
 $('#main').addEventListener('change', e => {
   if (e.target.dataset.chg === 'sumYear') { state.sumYear = +e.target.value; render(); }
@@ -548,23 +626,24 @@ $('#main').addEventListener('change', e => {
 $('#main').addEventListener('input', e => {
   if (e.target.classList.contains('vin')) { const it = itemById(e.target.dataset.id); e.target.dataset.st = e.target.value === '' ? '' : statusOf(it, +e.target.value); }
 });
+function legacyProfiles() {
+  try {
+    const r = JSON.parse(localStorage.getItem(OLD_KEY)); if (!r || !r.profiles || !r.data) return [];
+    return r.profiles.filter(p => !p.locked && r.data[p.id] && (Object.keys(r.data[p.id].records || {}).length || (r.data[p.id].exams || []).length)).map(p => ({ id: p.id, name: p.name, data: r.data[p.id] }));
+  } catch (e) { return []; }
+}
 $('#file').addEventListener('change', async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
   try {
-    const r = JSON.parse(await f.text());
-    if (!r.profiles || !r.data || !r.profiles.length) throw 0;
-    r.blobs ||= {};
-    if (r.profiles.some(p => p.locked && !r.blobs[p.id])) throw 0;
-    if (!confirm(`파일의 사람 ${r.profiles.length}명을 추가합니다. (같은 사람이 이미 있으면 파일 내용으로 덮어씁니다.) 계속할까요?`)) return;
-    r.profiles.forEach(p => {
-      const i = S.profiles.findIndex(x => x.id === p.id); if (i >= 0) S.profiles[i] = p; else S.profiles.push(p);
-      delete keys[p.id];
-      if (p.locked) { S.blobs[p.id] = r.blobs[p.id]; delete S.data[p.id]; }
-      else { delete S.blobs[p.id]; S.data[p.id] = r.data[p.id] || { records: {}, custom: [], exams: [] }; }
-    });
-    state.sel = null; state.inYear = null; state.examKind = ''; state.examTag = ''; await persist(); go('summary');
-    toast(r.profiles.some(p => p.locked) ? '가져왔어요. 잠긴 사람은 선택하면 비밀번호를 물어봐요' : '가져왔어요');
-  } catch (err) { toast('올바른 HealthTrack 백업 파일이 아니에요'); }
+    const r = JSON.parse(await f.text()); let d = null;
+    if (r.format === 'healthtrack-profile') d = r.data;
+    else if (r.records || r.exams) d = r;
+    else if (r.profiles && r.data) { const q = r.profiles.find(x => x.name === prof().name) || r.profiles[0]; if (q.locked) { toast('암호화된 예전 백업 파일은 가져올 수 없어요'); return; } d = r.data[q.id]; }
+    if (!d || typeof (d.records || {}) !== 'object') throw 0;
+    if (!confirm(`‘${prof().name}’의 기록을 파일 내용으로 바꿉니다. 계속할까요?`)) return;
+    S.data[prof().id] = { records: d.records || {}, custom: d.custom || [], exams: d.exams || [] };
+    state.sel = null; state.inYear = null; state.examKind = ''; state.examTag = ''; save(); go('summary'); toast('가져왔어요');
+  } catch (err) { toast('올바른 HealthTrack 기록 파일이 아니에요'); }
 });
 
 render();
