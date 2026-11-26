@@ -1,6 +1,8 @@
 name = "healthtrack"
 main = "src/worker.js"
 compatibility_date = "2025-09-01"
+workers_dev = true
+preview_urls = false
 
 [assets]
 directory = "./public"
@@ -10,4 +12,4 @@ binding = "ASSETS"
 binding = "DB"
 database_name = "healthtrack"
 # 배포 전에 `npx wrangler d1 create healthtrack` 결과의 database_id로 바꿉니다.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "7220d334-3334-4c05-85a6-e40e0adebb82"
