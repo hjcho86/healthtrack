@@ -221,8 +221,8 @@ function stackChart(rows) {
 }
 
 /* ---------- 상태 ---------- */
-const state = { view: 'summary', from: 'summary', detail: null, q: '', sel: null, inYear: null, sumYear: null, examTag: '', examKind: '', editExam: null };
-const TABS = [['summary', '요약'], ['table', '연도별 표'], ['trend', '추이'], ['exams', '검사 기록'], ['input', '수치 입력'], ['data', '설정·데이터']];
+const state = { view: 'summary', from: 'summary', detail: null, q: '', sel: null, inYear: null, sumYear: null, examTag: '', examKind: '', examPlace: '', gsym: '', editExam: null };
+const TABS = [['summary', '요약'], ['table', '연도별 표'], ['trend', '추이'], ['exams', '검사 기록'], ['guide', '검사 가이드'], ['family', '가족'], ['input', '수치 입력'], ['data', '설정·데이터']];
 const TAGS = { '정상': 'ok', '경과관찰': 'warn', '이상': 'bad', '조치': 'act', '예정': 'plan' };
 const tagBadge = t => `<span class="badge ${TAGS[t] || 'none'}">${esc(t)}</span>`;
 const badge = st => `<span class="badge ${st}">${LABEL[st]}</span>`;
@@ -241,27 +241,55 @@ const hasData = () => years().length > 0;
 
 /* 다음에 받을 검사: 직전 기록의 권장 추적 연도 + 예정 항목 */
 function upcoming() {
-  const list = examList(), map = {};
+  const list = examList(), map = {}, Y = new Date().getFullYear();
   const doneAfter = (kind, y) => list.some(e => e.kind === kind && e.tag !== '예정' && e.year >= y);
   const latest = {};
   list.filter(e => e.tag !== '예정').forEach(e => { if (!latest[e.kind] || e.year > latest[e.kind].year || (e.year === latest[e.kind].year && (e.date || '') > (latest[e.kind].date || ''))) latest[e.kind] = e; });
   for (const k in latest) { const l = latest[k]; if (l.due && !doneAfter(k, l.due)) map[k] = { kind: k, due: +l.due, last: l, plan: null }; }
+  // 기록에 추적 연도가 없는 검사는 일반적인 권장 주기(가이드)로 계산
+  GUIDE.filter(g => g.interval).forEach(g => {
+    const l = latest[g.kind]; if (!l || l.due || map[g.kind]) return;
+    const due = l.year + g.interval; if (due <= Y) map[g.kind] = { kind: g.kind, due, last: l, plan: null, auto: g.interval };
+  });
   list.filter(e => e.tag === '예정' && !doneAfter(e.kind, e.year)).forEach(e => { map[e.kind] = { kind: e.kind, due: e.year, last: latest[e.kind] || null, plan: e }; });
   return Object.values(map).sort((a, b) => a.due - b.due || a.kind.localeCompare(b.kind));
 }
+function dueLabel(u) {
+  const Y = new Date().getFullYear(), late = u.due < Y, now = u.due === Y;
+  const lab = u.plan ? (late ? '기간 지남' : now ? '올해 예정' : `${u.due}년 예정`)
+    : u.auto ? (late ? `${u.auto}년 주기 · 지남` : `올해 권장 (${u.auto}년 주기)`)
+    : (late ? `${u.due}년 권장 · 지남` : now ? '올해 권장' : `${u.due}년 권장`);
+  return { lab, cls: late ? 'bad' : now ? 'warn' : 'plan' };
+}
 function upHtml() {
   const up = upcoming(); if (!up.length) return '';
-  const Y = new Date().getFullYear();
   return `<div class="card"><h3>다음에 받을 검사 (${up.length})</h3><div class="list">${up.map(u => {
-    const late = u.due < Y, now = u.due === Y;
-    const lab = u.plan ? (late ? '기간 지남' : now ? '올해 예정' : `${u.due}년 예정`) : (late ? `${u.due}년 권장 · 지남` : now ? '올해 권장' : `${u.due}년 권장`);
-    const cls = late ? 'bad' : now ? 'warn' : 'plan';
+    const { lab, cls } = dueLabel(u);
     const info = (u.plan ? u.plan.result : u.last.result) || '';
     const prev = u.plan && u.last ? ` · 직전 ${u.last.year}년: ${u.last.result || ''}` : u.last && !u.plan ? ` · 마지막 ${u.last.year}년` : '';
     return `<div class="it" data-act="filterKind" data-v="${esc(u.kind)}"><div class="nm">${esc(u.kind)}<small>${esc(info + prev)}</small></div><span class="badge ${cls}">${lab}</span></div>`;
   }).join('')}</div></div>`;
 }
-const examRow = (e, showYear) => `<div class="ex"><div class="exh"><b>${esc(e.kind)}</b> ${tagBadge(e.tag)} <span class="muted small">${showYear ? e.year + '년 ' : ''}${esc(e.date || '')} ${esc(e.place || '')}</span><span class="sp"></span><button class="btn small" data-act="editExam" data-id="${esc(e.id)}">수정</button></div>${e.result ? `<div>${esc(e.result)}</div>` : ''}${e.note ? `<div class="muted small">${esc(e.note)}</div>` : ''}${e.due ? `<div class="small muted">권장 추적: ${esc(e.due)}년</div>` : ''}</div>`;
+const examRow = (e, showYear) => `<div class="ex"><div class="exh"><b>${esc(e.kind)}</b> ${tagBadge(e.tag)} <span class="muted small">${showYear ? e.year + '년 ' : ''}${esc(e.date || '')} ${placeLink(e.place)}</span><span class="sp"></span><button class="btn small" data-act="editExam" data-id="${esc(e.id)}">수정</button></div>${e.result ? `<div>${esc(e.result)}</div>` : ''}${e.note ? `<div class="muted small">${esc(e.note)}</div>` : ''}${e.due ? `<div class="small muted">권장 추적: ${esc(e.due)}년</div>` : ''}</div>`;
+const placeLink = pl => pl ? `<a href="https://map.naver.com/p/search/${encodeURIComponent(pl)}" target="_blank" rel="noopener noreferrer" title="지도에서 찾기">📍${esc(pl)}</a>` : '';
+function withProfile(id, fn) { const prev = S.current; S.current = id; try { return fn(); } finally { S.current = prev; } }
+// 결과·메모 문구('1년 뒤', '2년마다', '내년에도')에서 권장 추적 연도를 읽어냄
+function inferDue(year, text) {
+  const t = text || '', m = t.match(/(\d+)\s*년\s*(뒤|후|마다)/);
+  if (m && +m[1] > 0 && +m[1] <= 10) return year + +m[1];
+  if (/내년/.test(t)) return year + 1;
+  return null;
+}
+function histLine(kind) {
+  const es = examList().filter(e => e.kind === kind && e.tag !== '예정').sort((a, b) => a.year - b.year || (a.date || '').localeCompare(b.date || ''));
+  const plan = examList().find(e => e.kind === kind && e.tag === '예정');
+  if (!es.length) return `<div class="small muted">내 기록: 아직 없어요${plan ? ` · ${plan.year}년 예정` : ''}</div>`;
+  const last = es[es.length - 1], ago = new Date().getFullYear() - last.year, g = GUIDE.find(x => x.kind === kind);
+  return `<div class="small">내 기록: ${es.map(e => `${e.year} ${tagBadge(e.tag)}`).join(' · ')} <span class="muted">· 마지막 ${ago ? ago + '년 전' : '올해'}${g && g.interval ? ` · 권장 ${g.interval}년 주기 → ${last.year + g.interval}년` : ''}</span> <a href="#" data-act="filterKind" data-v="${esc(kind)}">기록 보기</a></div>`;
+}
+const guideCard = (g, open) => `<details class="gd" ${open ? 'open' : ''}><summary><b>${esc(g.kind)}</b> <span class="muted small">${esc(g.cat)}${g.interval ? ' · 권장 ' + g.interval + '년 주기' : ''}</span></summary><div class="gdb"><p>${esc(g.what)}</p><p><b>잘 찾는 것</b> ${esc(g.good)}</p><p><b>준비</b> ${esc(g.prep)}</p><p><b>주기</b> ${esc(g.cycle)}</p>${histLine(g.kind)}</div></details>`;
+const termCard = t => `<div class="ex"><b>${esc(t.name)}</b><div>${esc(t.text)}</div></div>`;
+const symCard = sy => `<div class="card"><h3>${esc(sy.sym)}</h3><p class="muted small">${esc(sy.note)}</p>${sy.exams.map(k => { const g = GUIDE.find(x => x.kind === k); return g ? guideCard(g, true) : `<div class="ex"><b>${esc(k)}</b></div>`; }).join('')}</div>`;
 function defaultYear(ys) {
   const cnt = ys.map(y => items().filter(it => series(it).some(p => p.year === y)).length), mx = Math.max(...cnt);
   for (let i = ys.length - 1; i >= 0; i--) if (cnt[i] >= mx / 2) return ys[i];
@@ -339,12 +367,36 @@ const views = {
       const es = list.filter(e => e.kind === k && e.year === y); if (!es.length) return '<td class="muted">·</td>';
       const e = es[es.length - 1]; return `<td class="${TAGS[e.tag] || ''}" title="${esc((e.result || '') + (es.length > 1 ? ` (+${es.length - 1}건)` : ''))}">${esc(e.tag)}</td>`;
     }).join('')}</tr>`).join('')}</tbody></table></div>`;
-    const shown = list.filter(e => (!Z || e.tag === Z) && (!K || e.kind === K));
+    const places = [...new Set(list.map(e => e.place).filter(Boolean))], PL = state.examPlace;
+    const shown = list.filter(e => (!Z || e.tag === Z) && (!K || e.kind === K) && (!PL || e.place === PL));
     const byY = {}; shown.forEach(e => (byY[e.year] ||= []).push(e));
     const tl = Object.keys(byY).map(Number).sort((a, b) => b - a).map(y => `<div class="card"><h3>${y}년 <small class="muted">${byY[y].length}건</small></h3>${byY[y].map(e => examRow(e)).join('')}</div>`).join('');
     return `${form}${upHtml()}${matrix}
-      <div class="chips"><span class="chip ${!Z ? 'on' : ''}" data-act="filterTag" data-v="">전체</span>${Object.keys(TAGS).map(t => `<span class="chip ${Z === t ? 'on' : ''}" data-act="filterTag" data-v="${t}">${t}</span>`).join('')}${K ? `<span class="chip on" data-act="filterKind" data-v="${esc(K)}">${esc(K)} ✕</span>` : ''}</div>
+      <div class="chips"><span class="chip ${!Z ? 'on' : ''}" data-act="filterTag" data-v="">전체</span>${Object.keys(TAGS).map(t => `<span class="chip ${Z === t ? 'on' : ''}" data-act="filterTag" data-v="${t}">${t}</span>`).join('')}${places.map(pl => `<span class="chip ${PL === pl ? 'on' : ''}" data-act="filterPlace" data-v="${esc(pl)}">📍${esc(pl)}</span>`).join('')}${K ? `<span class="chip on" data-act="filterKind" data-v="${esc(K)}">${esc(K)} ✕</span>` : ''}</div>
       ${tl || '<p class="muted">조건에 맞는 기록이 없어요.</p>'}`;
+  },
+  guide() {
+    const sym = SYMPTOMS.find(x => x.sym === state.gsym), cats = [...new Set(GUIDE.map(g => g.cat))];
+    return `<div class="card"><h2>증상으로 검사 찾기</h2><p class="muted small">참고용 안내이며 진단이 아니에요. 증상이 심하거나 갑자기 생기면 검진을 기다리지 말고 바로 진료받으세요. 위 검색창에 ‘MRI’, ‘속쓰림’, ‘갑상선’처럼 입력해도 찾아줘요.</p>
+      <div class="chips">${SYMPTOMS.map(x => `<span class="chip ${sym && sym.sym === x.sym ? 'on' : ''}" data-act="pickSym" data-v="${esc(x.sym)}">${esc(x.sym)}</span>`).join('')}</div></div>
+      ${sym ? symCard(sym) : ''}
+      <div class="card"><h2>MRI·MRA·CT, 뭐가 달라요?</h2>${TERMS.map(termCard).join('')}</div>
+      <div class="card"><h2>검사 사전</h2>${cats.map(c => `<h3 class="gcat">${esc(c)}</h3>${GUIDE.filter(g => g.cat === c).map(g => guideCard(g)).join('')}`).join('')}</div>`;
+  },
+  family() {
+    return S.profiles.map(p => {
+      if (!keys[p.id]) return `<div class="card"><div class="row"><h3 style="margin:0">${esc(p.name)}</h3><span class="badge none">잠김</span><span class="sp"></span><button class="btn" data-act="pick" data-id="${esc(p.id)}">비밀번호 입력</button></div></div>`;
+      return withProfile(p.id, () => {
+        const ys = years(), up = upcoming(); let head = '';
+        if (ys.length) {
+          const Y = defaultYear(ys), c = { ok: 0, warn: 0, bad: 0 };
+          items().forEach(it => { const pt = series(it).find(x => x.year === Y); if (pt && c[pt.status] != null) c[pt.status]++; });
+          head = `<span class="muted small">${Y}년 검진</span><span class="badge ok">정상 ${c.ok}</span><span class="badge warn">주의 ${c.warn}</span><span class="badge bad">이상 ${c.bad}</span>`;
+        }
+        const rows = up.slice(0, 6).map(u => { const { lab, cls } = dueLabel(u); return `<div class="it" data-act="pick" data-id="${esc(p.id)}" data-go="exams"><div class="nm">${esc(u.kind)}<small>${esc((u.plan ? u.plan.result : u.last.result) || '')}</small></div><span class="badge ${cls}">${lab}</span></div>`; }).join('');
+        return `<div class="card"><div class="row"><h3 style="margin:0">${esc(p.name)}</h3>${head}<span class="sp"></span><button class="btn small" data-act="pick" data-id="${esc(p.id)}" data-go="exams">검사 기록</button></div>${rows ? `<div class="list">${rows}</div>` : '<p class="muted small">받을 검사 알림이 없어요.</p>'}${up.length > 6 ? `<p class="muted small">외 ${up.length - 6}건</p>` : ''}</div>`;
+      });
+    }).join('') + '<p class="muted small">이 브라우저에서 비밀번호로 잠금을 푼 사람만 보여요. 각자의 기록은 따로 암호화되어 있어서, 서로의 비밀번호 없이 보는 공유는 지원하지 않아요.</p>';
   },
   detail() {
     const it = itemById(state.detail); if (!it) return '<p>항목을 찾을 수 없어요.</p>';
@@ -380,9 +432,15 @@ const views = {
     }
     const res = items().map(it => ({ it, sc: matchScore(it, q) })).filter(x => x.sc).sort((a, b) => b.sc - a.sc);
     const exm = examList().filter(e => norm([e.kind, e.result, e.note, e.place, e.tag].join(' ')).includes(nq)).sort((a, b) => b.year - a.year || (b.date || '').localeCompare(a.date || ''));
-    if (!res.length && !exm.length) return `<div class="card empty">‘${esc(q)}’에 해당하는 검사를 찾지 못했어요.<br><span class="small">예: 콜레스테롤, 혈압, 간, 신장, 빈혈, 갑상선, 내시경, ㅎㅅㅅ(초성)</span></div>`;
+    const gm = GUIDE.filter(g => norm([g.kind, ...g.aliases].join(' ')).includes(nq) || (nq.length >= 2 && norm(g.what + g.good).includes(nq))).slice(0, 8);
+    const tm = TERMS.filter(t => norm(t.name).includes(nq));
+    const sm = SYMPTOMS.filter(x => norm(x.sym).includes(nq) || x.keys.some(k => norm(k).includes(nq) || (norm(k).length > 1 && nq.includes(norm(k))))).slice(0, 3);
+    if (!res.length && !exm.length && !gm.length && !tm.length && !sm.length) return `<div class="card empty">‘${esc(q)}’에 해당하는 검사를 찾지 못했어요.<br><span class="small">예: 콜레스테롤, 혈압, 간, 신장, 빈혈, 갑상선, 내시경, ㅎㅅㅅ(초성)</span></div>`;
     const withData = res.map(r => ({ ...r, ser: series(r.it) }));
-    h = `<p class="muted">‘${esc(q)}’ 검색 결과 — 수치 항목 ${res.length}건 · 검사 기록 ${exm.length}건</p>`;
+    h = `<p class="muted">‘${esc(q)}’ 검색 결과 — 검사 안내 ${gm.length + tm.length}건 · 내 검사 기록 ${exm.length}건 · 수치 항목 ${res.length}건</p>`;
+    if (tm.length) h += `<div class="card"><h3>용어 설명</h3>${tm.map(termCard).join('')}</div>`;
+    h += sm.map(symCard).join('');
+    if (gm.length) h += `<div class="card"><h3>검사 안내 (${gm.length})</h3>${gm.map(g => guideCard(g, gm.length <= 2)).join('')}</div>`;
     if (exm.length) h += `<div class="card"><h3>검사 기록 (${exm.length})</h3>${exm.slice(0, 40).map(e => examRow(e, true)).join('')}${exm.length > 40 ? '<p class="muted small">상위 40건만 표시했어요. 검색어를 더 좁혀 보세요.</p>' : ''}</div>`;
     h += '<div class="grid">';
     for (const { it, ser } of withData) {
@@ -433,10 +491,11 @@ const views = {
 /* ---------- 렌더 ---------- */
 function render() {
   $('#prof').innerHTML = S.profiles.map(p => `<option value="${p.id}" ${p.id === S.current ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
-  $('#tabs').innerHTML = TABS.map(([k, n]) => `<button data-tab="${k}" class="${state.view === k || (state.view === 'detail' && state.from === k) ? 'on' : ''}">${n}</button>`).join('');
+  $('#tabs').innerHTML = TABS.filter(([k]) => k !== 'family' || S.profiles.length > 1).map(([k, n]) => `<button data-tab="${k}" class="${state.view === k || (state.view === 'detail' && state.from === k) ? 'on' : ''}">${n}</button>`).join('');
   $('#lockbtn').hidden = isLocked();
-  $('#main').innerHTML = isLocked() ? lockHtml() : views[state.view]();
-  if (isLocked() && S.acct[prof().id] === undefined) loadAcct();
+  const gate = isLocked() && !['guide', 'search'].includes(state.view); // 가이드·검색은 로그인 없이도 볼 수 있음
+  $('#main').innerHTML = gate ? lockHtml() : views[state.view]();
+  if (gate && S.acct[prof().id] === undefined) loadAcct();
   const pw = $('#pw') || $('#pw1'); if (pw && document.activeElement !== $('#q')) pw.focus();
 }
 const isLocked = () => !keys[prof().id];
@@ -511,6 +570,9 @@ const actions = {
     toast(`${keys.length}개 항목을 채웠어요${miss ? ` (인식 못한 줄 ${miss})` : ''} — 확인 후 저장하세요`);
   },
   filterTag(t) { state.examTag = t.dataset.v; render(); },
+  filterPlace(t) { state.examPlace = state.examPlace === t.dataset.v ? '' : t.dataset.v; render(); },
+  pickSym(t) { state.gsym = state.gsym === t.dataset.v ? '' : t.dataset.v; render(); },
+  pick(t) { S.current = t.dataset.id; state.sel = null; state.inYear = null; saveLocal(); go(keys[S.current] ? (t.dataset.go || 'summary') : 'summary'); },
   filterKind(t) { const v = t.dataset.v; go('exams', { examKind: state.view === 'exams' && state.examKind === v ? '' : v }); },
   editExam(t) { go('exams', { editExam: t.dataset.id }); },
   cancelExam() { state.editExam = null; render(); },
@@ -518,9 +580,11 @@ const actions = {
     const g = id => $(id).value.trim(), year = +g('#ex_year'), kind = g('#ex_kind');
     if (!year || !kind) return toast('연도와 검사 종류는 꼭 입력하세요');
     const rec = { year, date: g('#ex_date'), place: g('#ex_place'), kind, tag: g('#ex_tag'), result: g('#ex_result'), due: g('#ex_due') ? +g('#ex_due') : null, note: g('#ex_note') };
+    let inferred = false;
+    if (!rec.due) { const d = inferDue(year, rec.result + ' ' + rec.note); if (d) { rec.due = d; inferred = true; } }
     const list = examList(), ex = list.find(e => e.id === state.editExam);
     if (ex) Object.assign(ex, rec); else list.push({ id: 'e' + uid(), ...rec });
-    state.editExam = null; save(); render(); toast('검사 기록을 저장했어요');
+    state.editExam = null; save(); render(); toast(inferred ? `저장했어요. 문구를 보고 권장 추적 연도를 ${rec.due}년으로 잡았어요` : '검사 기록을 저장했어요');
   },
   delExam() { if (confirm('이 검사 기록을 삭제할까요?')) { pdata().exams = examList().filter(e => e.id !== state.editExam); state.editExam = null; save(); render(); } },
   sample() {
@@ -616,7 +680,7 @@ const actions = {
   importJson() { $('#file').click(); },
   wipe() { if (confirm(`‘${prof().name}’의 기록을 모두 지웁니다(서버에 저장된 것도 지워져요). 되돌릴 수 없어요. 계속할까요?`)) { S.data[prof().id] = { records: {}, custom: [], exams: [] }; state.sel = null; state.inYear = null; save(); go('summary'); } },
 };
-$('#main').addEventListener('click', e => { const t = e.target.closest('[data-act]'); if (t && actions[t.dataset.act]) actions[t.dataset.act](t, e); });
+$('#main').addEventListener('click', e => { const t = e.target.closest('[data-act]'); if (t && actions[t.dataset.act]) { if (t.tagName === 'A') e.preventDefault(); actions[t.dataset.act](t, e); } });
 $('#main').addEventListener('keydown', e => { if (e.key !== 'Enter') return; if (e.target.id === 'pw') actions.unlock(); else if (e.target.id === 'pw2') actions.claim(); });
 $('#lockbtn').addEventListener('click', () => actions.relock());
 $('#main').addEventListener('change', e => {
